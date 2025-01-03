@@ -24,7 +24,10 @@ typedef enum {
 
 typedef enum {
     PREPARE_SUCCESS,
+    PREPARE_NEGATIVE_ID,
+    PREPARE_ID_TOO_BIG,
     PREPARE_SYNTAX_ERROR,
+    PREPARE_STRING_TOO_LONG,
     PREPARE_UNRECOGNIZED_STATEMENT
 } PrepareResult;
 
@@ -38,8 +41,8 @@ typedef enum {
 #define COLUMN_EMAIL_SIZE 255
 typedef struct {
     u32 id;
-    char username[COLUMN_USERNAME_SIZE];
-    char email[COLUMN_EMAIL_SIZE];
+    char username[COLUMN_USERNAME_SIZE + 1];
+    char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 
 typedef struct {
@@ -118,24 +121,49 @@ MetaCommandResult do_meta_command(StringBuilder* sb)
 {
     if (strcmp(sb->data, ".exit") == 0) {
         return META_COMMAND_EXIT;
-        ARRAY_FREE(sb);
-        exit(EXIT_SUCCESS);
     }
     return META_COMMAND_UNKNOWN_COMMAND;
+}
+
+PrepareResult prepare_insert(StringBuilder* sb, Statement* s)
+{
+    s->type = STATEMENT_INSERT;
+    strtok(sb->data, " ");
+    char* id_string = strtok(NULL, " ");
+    char* username = strtok(NULL, " ");
+    char* email = strtok(NULL, " ");
+
+    if (!id_string || !username || !email) {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    if (strlen(username) > COLUMN_USERNAME_SIZE) {
+        return PREPARE_STRING_TOO_LONG;
+    }
+    if (strlen(email) > COLUMN_EMAIL_SIZE) {
+        return PREPARE_STRING_TOO_LONG;
+    }
+
+    i64 id = atoll(id_string);
+    if (id < 0) {
+        return PREPARE_NEGATIVE_ID;
+    }
+    if (id > UINT32_MAX) {
+        return PREPARE_ID_TOO_BIG;
+    }
+
+    s->row_to_insert.id = (u32)id;
+    strcpy(s->row_to_insert.username, username);
+    strcpy(s->row_to_insert.email, email);
+
+    return PREPARE_SUCCESS;
 }
 
 PrepareResult prepare_statement(StringBuilder* sb, Statement* s)
 {
     assert(s && "Must provide a valid Statement ptr");
     if (strncmp(sb->data, "insert", 6) == 0) {
-        s->type = STATEMENT_INSERT;
-        int assigned = sscanf(sb->data, "insert %u %s %s",
-                              &s->row_to_insert.id, s->row_to_insert.username,
-                              s->row_to_insert.email);
-        if (assigned < 3) {
-            return PREPARE_SYNTAX_ERROR;
-        }
-        return PREPARE_SUCCESS;
+        return prepare_insert(sb, s);
     }
     if (strcmp(sb->data, "select") == 0) {
         s->type = STATEMENT_SELECT;
@@ -207,7 +235,7 @@ int main(void)
         if (sb.data[0] == '.') {
             switch (do_meta_command(&sb)) {
                 case META_COMMAND_SUCCESS:
-                    break;
+                    continue;
                 case META_COMMAND_EXIT:
                     goto exit;
                 case META_COMMAND_UNKNOWN_COMMAND:
@@ -220,8 +248,17 @@ int main(void)
         switch (prepare_statement(&sb, &statement)) {
             case PREPARE_SUCCESS:
                 break;
+            case PREPARE_NEGATIVE_ID:
+                printf("ID must be positive.\n");
+                continue;
+            case PREPARE_ID_TOO_BIG:
+                printf("ID must be smaller.\n");
+                continue;
             case PREPARE_SYNTAX_ERROR:
                 printf("Syntax error. Could not parse statement '%s'.\n", sb.data);
+                continue;
+            case PREPARE_STRING_TOO_LONG:
+                printf("String is too long.\n");
                 continue;
             case PREPARE_UNRECOGNIZED_STATEMENT:
                 printf("Unrecognized keyword at the beginning of statement '%s'.\n", sb.data);
@@ -233,10 +270,10 @@ int main(void)
                 printf("Executed.\n");
                 break;
             case EXECUTE_TABLE_FULL:
-                fprintf(stderr, "Table full.\n");
+                printf("Table full.\n");
                 break;
             case EXECUTE_FAILURE:
-                fprintf(stderr, "Execute failure.\n");
+                printf("Execute failure.\n");
                 break;
         }
     }
