@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 
 #include "array.h"
 #include "int_types.h"
@@ -65,18 +66,48 @@ const u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const u32 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 typedef struct {
-    u32 rows_count;
+    FILE* file;
+    u32 file_length;
     void* pages[TABLE_MAX_PAGES];
+} Pager;
+
+typedef struct {
+    Pager* pager;
+    u32 rows_count;
 } Table;
+
+void* get_page(Pager* p, u32 page_num)
+{
+    if (page_num >= TABLE_MAX_PAGES) {
+        printf("Tried to fetch a page out of bounds. %u > %u\n", page_num, TABLE_MAX_PAGES);
+        exit(EXIT_FAILURE);
+    }
+
+    if (!p->pages[page_num]) {
+        // Cache miss, must read from file
+        void* page = malloc(PAGE_SIZE);
+        u32 num_pages = p->file_length / PAGE_SIZE;
+        if (p->file_length % PAGE_SIZE) {
+            num_pages += 1;
+        }
+
+        if (page_num <= num_pages) {
+            fseek(p->file, page_num * PAGE_SIZE, SEEK_SET);
+            fread(page, PAGE_SIZE, 1, p->file);
+            rewind(p->file);
+        }
+
+        p->pages[page_num] = page;
+    }
+
+    return p->pages[page_num];
+}
 
 void* row_slot(Table* t, u32 row_num)
 {
     assert(t && "Must provide a valid to row_slot");
     u32 page_num = row_num / ROWS_PER_PAGE;
-    void* page = t->pages[page_num];
-    if (!page) {
-        page = t->pages[page_num] = malloc(PAGE_SIZE);
-    }
+    void* page = get_page(t->pager, page_num);
     u32 row_offset = row_num % ROWS_PER_PAGE;
     u32 byte_offset = row_offset * ROW_SIZE;
     return page + byte_offset;
@@ -91,8 +122,8 @@ void serialize_row(Row* r, void* dst)
 {
     assert(r && dst && "Must provide valid ptrs to serialize_row");
     memcpy(dst + ID_OFFSET, &r->id, ID_SIZE);
-    memcpy(dst + USERNAME_OFFSET, &r->username, USERNAME_SIZE);
-    memcpy(dst + EMAIL_OFFSET, &r->email, EMAIL_SIZE);
+    strncpy(dst + USERNAME_OFFSET, &r->username, USERNAME_SIZE);
+    strncpy(dst + EMAIL_OFFSET, &r->email, EMAIL_SIZE);
 }
 
 void deserialize_row(void* src, Row* r)
@@ -208,24 +239,102 @@ ExecuteResult execute_statement(Statement* s, Table* t)
     }
 }
 
-Table* create_table()
+Pager* pager_open(const char* filename)
 {
+    FILE* file = fopen(filename, "r+");
+    if (!file) {
+        file = fopen(filename, "w+");
+    }
+    if (!file) {
+        fprintf(stderr, "Error opening pager file.");
+        exit(EXIT_FAILURE);
+    }
+    fseek(file, 0, SEEK_END);
+    size_t length = ftell(file);
+    rewind(file);
+
+    Pager* pager = malloc(sizeof(Pager));
+    pager->file = file;
+    pager->file_length = length;
+    memset(pager->pages, 0, sizeof(pager->pages));
+    return pager;
+}
+
+Table* db_open(const char* filename)
+{
+    Pager* pager = pager_open(filename);
+    u32 rows_count = pager->file_length / ROW_SIZE;
     Table* t = malloc(sizeof(Table));
-    memset(t, 0, sizeof(Table));
+    t->pager = pager;
+    t->rows_count = rows_count;
     return t;
 }
 
-void destroy_table(Table* t)
+void pager_flush(Pager* p, u32 page_num, u32 size)
 {
-    for (u32 i = 0; t->pages[i]; i++) {
-        free(t->pages[i]);
+    if (!p->pages[page_num]) {
+        printf("Tried to flush a null page.\n");
+        exit(EXIT_FAILURE);
     }
+
+    if (fseek(p->file, page_num * PAGE_SIZE, SEEK_SET) != 0) {
+        printf("Error seeking: %d\n", errno);
+        exit(EXIT_FAILURE);
+    }
+
+    size_t written = fwrite(p->pages[page_num], size, 1, p->file);
+    if (written <= 0) {
+        printf("Error writing: %d\n", errno);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void db_close(Table* t)
+{
+    assert(t && "Must provide a valid Table ptr to db_close");
+    Pager* p = t->pager;
+    u32 full_pages_count = t->rows_count / ROWS_PER_PAGE;
+
+    for (u32 i = 0; i < full_pages_count; i++) {
+        if (!p->pages[i]) {
+            continue;
+        }
+        pager_flush(p, i , PAGE_SIZE);
+        free(p->pages[i]);
+    }
+
+    // There may be a partial page to write to the end of the file
+    // This should not be needed after we switch to a B-tree
+    uint32_t additional_rows_count = t->rows_count % ROWS_PER_PAGE;
+    if (additional_rows_count > 0) {
+        uint32_t page_num = full_pages_count;
+        if (p->pages[page_num] != NULL) {
+            pager_flush(p, page_num, additional_rows_count * ROW_SIZE);
+        }
+    }
+
+    if (fclose(p->file) != 0) {
+        printf("Error closing db file.\n");
+        exit(EXIT_FAILURE);
+    }
+    for (u32 i = 0; i < TABLE_MAX_PAGES; i++) {
+        void* page = p->pages[i];
+        if (page) {
+            free(page);
+        }
+    }
+    free(p);
     free(t);
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
-    Table* table = create_table();
+    if (argc < 2) {
+        printf("Must supply a database filename.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    Table* table = db_open(argv[1]);
     StringBuilder sb = {0};
     for (;;) {
         sb.count = 0;
@@ -278,7 +387,7 @@ int main(void)
         }
     }
 exit:
-    destroy_table(table);
+    db_close(table);
     ARRAY_FREE(&sb);
     exit(EXIT_SUCCESS);
 }
