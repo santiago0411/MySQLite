@@ -76,6 +76,38 @@ typedef struct {
     u32 rows_count;
 } Table;
 
+typedef struct {
+    Table* table;
+    u32 row_num;
+    bool end_of_table;
+} Cursor;
+
+Cursor table_start(Table* t)
+{
+    return (Cursor){
+        .table = t,
+        .row_num = 0,
+        .end_of_table = t->rows_count == 0
+    };
+}
+
+Cursor table_end(Table* t)
+{
+    return (Cursor){
+        .table = t,
+        .row_num = t->rows_count,
+        .end_of_table = true
+    };
+}
+
+void cursor_advance(Cursor* c)
+{
+    c->row_num += 1;
+    if (c->row_num == c->table->rows_count) {
+        c->end_of_table = true;
+    }
+}
+
 void* get_page(Pager* p, u32 page_num)
 {
     if (page_num >= TABLE_MAX_PAGES) {
@@ -103,11 +135,11 @@ void* get_page(Pager* p, u32 page_num)
     return p->pages[page_num];
 }
 
-void* row_slot(Table* t, u32 row_num)
+void* cursor_value(Cursor c)
 {
-    assert(t && "Must provide a valid to row_slot");
+    u32 row_num = c.row_num;
     u32 page_num = row_num / ROWS_PER_PAGE;
-    void* page = get_page(t->pager, page_num);
+    void* page = get_page(c.table->pager, page_num);
     u32 row_offset = row_num % ROWS_PER_PAGE;
     u32 byte_offset = row_offset * ROW_SIZE;
     return page + byte_offset;
@@ -122,8 +154,8 @@ void serialize_row(Row* r, void* dst)
 {
     assert(r && dst && "Must provide valid ptrs to serialize_row");
     memcpy(dst + ID_OFFSET, &r->id, ID_SIZE);
-    strncpy(dst + USERNAME_OFFSET, &r->username, USERNAME_SIZE);
-    strncpy(dst + EMAIL_OFFSET, &r->email, EMAIL_SIZE);
+    strncpy(dst + USERNAME_OFFSET, (const char*)&r->username, USERNAME_SIZE);
+    strncpy(dst + EMAIL_OFFSET, (const char*)&r->email, EMAIL_SIZE);
 }
 
 void deserialize_row(void* src, Row* r)
@@ -209,7 +241,8 @@ ExecuteResult execute_insert(Statement* s, Table* t)
     if (t->rows_count >= TABLE_MAX_ROWS) {
         return EXECUTE_TABLE_FULL;
     }
-    serialize_row(&s->row_to_insert, row_slot(t, t->rows_count));
+    Cursor cursor = table_end(t);
+    serialize_row(&s->row_to_insert, cursor_value(cursor));
     t->rows_count += 1;
     return EXECUTE_SUCCESS;
 }
@@ -217,10 +250,12 @@ ExecuteResult execute_insert(Statement* s, Table* t)
 ExecuteResult execute_select(Statement* s, Table* t)
 {
     assert(s && t && "Must provide valid ptrs to execute_select");
+    Cursor cursor = table_start(t);
     Row row;
-    for (u32 i = 0; i< t->rows_count; i++) {
-        deserialize_row(row_slot(t, i), &row);
+    while (!cursor.end_of_table) {
+        deserialize_row(cursor_value(cursor), &row);
         print_row(&row);
+        cursor_advance(&cursor);
     }
     return EXECUTE_SUCCESS;
 }
